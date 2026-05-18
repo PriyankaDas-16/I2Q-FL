@@ -6,7 +6,7 @@ from typing import Any, Mapping
 import numpy as np
 import cv2
 import psutil
-
+import scipy.stats
 from ..communicaiton import ModelWeightsHandler, get_client_communicator
 from ..communicaiton.events import *
 from ..config import ConfigurationManager, Role, ServerFlaskInterface
@@ -16,7 +16,7 @@ from .logger import HyperLogger
 from .node import Node
 
 import matplotlib.pyplot as plt
-
+import tensorflow as tf
 
 class Client(Node):
     """a client node implementation based on FlaskNode."""
@@ -41,7 +41,6 @@ class Client(Node):
         self._model_weights_io_handler = ModelWeightsHandler(download_url_pattern)
         self._register_handles()
         self.start()
-
     def _init_logger(self, container_id, **kwargs):
         self._hyper_logger = HyperLogger('container', f'Container{container_id}')
         self.logger = self._hyper_logger.get()
@@ -135,67 +134,137 @@ class Client(Node):
                     self.logger.info(f"CPU percent: {psutil.cpu_percent()}%") 
                     self.logger.info(f"{split_bar}latency {split_bar}")
                     self.logger.info(f"latency for model training = {latency_end-latency_start} seconds")                   
+                    if client_fit_results and mdl_cfg.strategy_name == 'FedAvg' and current_round == 1:
 
-                    # modification for CNN round 1
-                    if client_fit_results and mdl_cfg.strategy_name == 'FedAvg' and current_round==1:
-                        # for this round and this client make the feature maps folders
-                        feature_maps = None
-                        mainFolder = f"./FeatureMaps/Client_{client_ctx.id}"
-                        if os.path.exists(mainFolder):
-                            self.logger.info(f"Removing {mainFolder}")
-                            shutil.rmtree(mainFolder)
-                        os.makedirs(mainFolder)
+                        train_loss, train_data_size, _, classOrdered = client_fit_results
+                        base_model = client_ctx.strategy.ml_model
 
-                        train_loss, train_data_size, feature_maps, classOrdered = client_fit_results
+                        # Create ONCE (important!)
+                        feature_extractor = base_model.get_feature_extractor()
+
+                        labels = np.argmax(client_ctx.strategy.train_data['y'], axis=1)
+                        # 🔥 Get training data (images)
+                        x_data = client_ctx.strategy.train_data['x']
+                        #base_model = client_ctx.strategy.ml_model
+                        conv3_model = tf.keras.Model(
+                            inputs=base_model.model.input,
+                            outputs=base_model.model.layers[1].output
+                          )
+                        
+                        # 🔥 Build feature extractor (Conv2 output like before)
+#                        feature_extractor = client_ctx.strategy.model.get_feature_extractor()
 
                         classesRequired = np.unique(classOrdered)
 
-                        for classValue in classesRequired :
-                            os.makedirs(os.path.join(mainFolder, f"Class_{classValue}"))
+                        countNquality: dict[int, dict[int, float]] = {}
 
-                        for idx, imageFeatures in enumerate(feature_maps) :
-                            imageClassFolder = os.path.join(mainFolder, f"Class_{classOrdered[idx]}", f"Image_{idx}")
-                            os.makedirs(imageClassFolder)
+                        for Classi in classesRequired:
+                            Classi = int(Classi)
 
-                            for i in range(feature_maps.shape[-1]):
-                                plt.matshow(imageFeatures[:,:,i])
-                                plt.savefig(os.path.join(imageClassFolder, f"feature_{i}.png"))
+                            indices = np.where(classOrdered == Classi)[0]
+
+                            ImageQualitySum = 0
+                            ImagesCount = 0
+
+                            for idx in indices:
+                                ImagesCount += 1
+
+                                # 🔥 Take ONE image only
+                                img = x_data[idx:idx+1]   # shape (1, H, W, C)
+
+                                # 🔥 Get feature map for this image ONLY
+                                feature_map = feature_extractor.predict(img, verbose=0)[0]  # (H, W, C)
+
+                                rhoValuesSum = 0
+                                featureMapsCount = feature_map.shape[-1]
+
+                                # 🔥 SAME rho logic (vectorized)
+                                for i in range(featureMapsCount):
+                                    fmap = feature_map[:, :, i]
+
+                                    meanIntensity = np.mean(fmap)
+
+                                    rhoIJ = np.sum(fmap > meanIntensity) / fmap.size
+
+                                    rhoValuesSum += rhoIJ
+
+                                qualityIJ = rhoValuesSum / featureMapsCount
+                                ImageQualitySum += qualityIJ
+
+                            class_quality = ImageQualitySum / (ImagesCount + 1e-8)
+
+                            countNquality[Classi] = {
+                                    int(ImagesCount): float(class_quality)
+                                      }
+
+                            self.logger.info(f"countNquality: {countNquality}")
+                    # modification for CNN round 1
+               #     if client_fit_results and mdl_cfg.strategy_name == 'FedAvg' and current_round==1:
+               #         # for this round and this client make the feature maps folders
+               #         feature_maps = None
+               #         mainFolder = f"./FeatureMaps/Client_{client_ctx.id}"
+               #         if os.path.exists(mainFolder):
+               #             self.logger.info(f"Removing {mainFolder}")
+               #             shutil.rmtree(mainFolder)
+               #         os.makedirs(mainFolder)
+
+               #         train_loss, train_data_size, feature_maps, classOrdered = client_fit_results
+
+               #         classesRequired = np.unique(classOrdered)
+
+               #         for classValue in classesRequired :
+               #             os.makedirs(os.path.join(mainFolder, f"Class_{classValue}"))
+
+                #        for idx, imageFeatures in enumerate(feature_maps) :
+                #            imageClassFolder = os.path.join(mainFolder, f"Class_{classOrdered[idx]}", f"Image_{idx}")
+                #            os.makedirs(imageClassFolder)#
+
+               #             for i in range(feature_maps.shape[-1]):
+               #                 plt.matshow(imageFeatures[:,:,i])
+               #                 plt.savefig(os.path.join(imageClassFolder, f"feature_{i}.png"))
 
                         # vector1 and vector2 calcualtion
                         # countNquality{classNumber i, {numer of images : quality}}
-                        countNquality: dict[int, dict[int,float]] = {}
+                #        countNquality: dict[int, dict[int,float]] = {}
 
-                        for classFolder in os.listdir(mainFolder) :
-                            Classi = int(classFolder.partition("Class_")[2])
-                            ImageQualitySum = 0
-                            ImagesCount = 0
-                            for imageId in os.listdir(os.path.join(mainFolder, classFolder)) :
+                #        for classFolder in os.listdir(mainFolder) :
+                #            Classi = int(classFolder.partition("Class_")[2])
+                #            ImageQualitySum = 0
+                #            ImagesCount = 0
+                #            for imageId in os.listdir(os.path.join(mainFolder, classFolder)) :
                                 # Imagej = imageId.partition("Image_")[2]
-                                rhoValuesSum = 0
-                                featureMapsCount= 0
-
-                                for featuremapImage in os.listdir(os.path.join(mainFolder, classFolder,imageId)):
-                                    featureMapsCount += 1
+                #                rhoValuesSum = 0
+                #                featureMapsCount= 0
+                #                entropyValuesSum= 0
+                #                for featuremapImage in os.listdir(os.path.join(mainFolder, classFolder,imageId)):
+                #                    featureMapsCount += 1
+                #                    
+                #                    img = cv2.imread(os.path.join(mainFolder, classFolder,imageId,featuremapImage),cv2.IMREAD_GRAYSCALE)
+#                                    img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+                #                    meanIntensity= img.mean()
+#                                    img = cv2.GaussianBlur(img, (5, 5), 0) 
+#                                    hist, bin_edges = np.histogram(img, bins=256, range=(0, 255), density=True)
+#                                    hist = hist[hist > 0]
                                     
-                                    img = cv2.imread(os.path.join(mainFolder, classFolder,imageId,featuremapImage))
-                                    img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-                                    meanIntensity = img.mean()
+                 #                   rhoIntensityGreaterThanMean = 0
+                 #                   rhoTotalPixels = 0
+                 #                   for x in range(img.shape[0]) :
+                 #                       for y in range(img.shape[1]) :
+                 #                           rhoTotalPixels += 1
+                 #                           if img[x,y] > meanIntensity :
+                 #                               rhoIntensityGreaterThanMean += 1
 
-                                    rhoIntensityGreaterThanMean = 0
-                                    rhoTotalPixels = 0
-                                    for x in range(img.shape[0]) :
-                                        for y in range(img.shape[1]) :
-                                            rhoTotalPixels += 1
-                                            if img[x,y] > meanIntensity :
-                                                rhoIntensityGreaterThanMean += 1
+#                                    entropy = -np.sum(hist * np.log2(hist))
+#                                    entropyValuesSum += entropy
 
-                                    rhoIJ = rhoIntensityGreaterThanMean / rhoTotalPixels
-                                    rhoValuesSum += rhoIJ
+                  #                  rhoIJ = rhoIntensityGreaterThanMean / rhoTotalPixels
+                  #                  rhoValuesSum += rhoIJ
 
-                                qualityIJ = rhoValuesSum / featureMapsCount   
-                                ImagesCount += 1
-                            ImageQualitySum += qualityIJ
-                            countNquality[Classi] = {ImagesCount : ImageQualitySum}                             
+                  
+                  #              qualityIJ = rhoValuesSum / featureMapsCount   
+                  #              ImagesCount += 1
+                  #          ImageQualitySum += qualityIJ
+                  #          countNquality[Classi] = {ImagesCount : ImageQualitySum}                             
 
                     elif client_fit_results:
                         train_loss, train_data_size = client_fit_results
